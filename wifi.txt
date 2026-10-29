@@ -1,0 +1,634 @@
+/*
+  =============================================================================
+  Project: Smart Medicine Dispenser - ESP-01 Web Controller
+  Microcontroller: ESP8266 (ESP-01 / ESP-01S)
+  Description:
+    - Hosts a SoftAP ("MediDispense-WiFi") with web portal (192.168.4.1)
+    - Professional, modern Light Medical Theme (HTML + CSS + JavaScript)
+    - Allows user to set Medicine Name + Time for 4 Doses
+    - Stores medicine names & schedules in EEPROM
+    - Syncs phone's clock to the STM32 DS3231 RTC
+    - Manual 1-step test dispense button
+    - Communicates with STM32 Blue Pill over UART Serial (115200 baud)
+  =============================================================================
+*/
+
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <EEPROM.h>
+
+// --- WiFi AP Settings ---
+const char *apSSID = "MediDispense-WiFi";
+const char *apPASS = "12345678"; // At least 8 characters
+
+ESP8266WebServer server(80);
+
+// --- Schedule Data Structure ---
+struct Schedule {
+  char dose1[6];  // "08:00"
+  char dose2[6];  // "13:00"
+  char dose3[6];  // "18:00"
+  char dose4[6];  // "21:00"
+  bool en1;
+  bool en2;
+  bool en3;
+  bool en4;
+  char name1[16]; // e.g. "Paracetamol"
+  char name2[16]; // e.g. "Amoxicillin"
+  char name3[16]; // e.g. "Vitamin C"
+  char name4[16]; // e.g. "Melatonin"
+} schedule;
+
+#define EEPROM_ADDR 0
+
+// --- Professional Medical Light Theme Webpage (HTML + CSS + JS) ---
+const char INDEX_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MediDispense Hub</title>
+  <style>
+    :root {
+      --bg: #f1f5f9;
+      --card-bg: #ffffff;
+      --primary: #0284c7;
+      --primary-hover: #0369a1;
+      --primary-light: #e0f2fe;
+      --accent: #10b981;
+      --accent-light: #ecfdf5;
+      --danger: #ef4444;
+      --danger-light: #fef2f2;
+      --text: #0f172a;
+      --text-muted: #64748b;
+      --border: #e2e8f0;
+      --border-focus: #38bdf8;
+      --shadow-sm: 0 1px 3px rgba(0,0,0,0.06);
+      --shadow-md: 0 8px 24px rgba(15, 23, 42, 0.08);
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
+    body {
+      background: linear-gradient(180deg, #f8fafc 0%, #e2e8f0 100%);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      padding: 16px;
+    }
+    .container {
+      width: 100%;
+      max-width: 460px;
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 24px;
+      padding: 28px 22px;
+      box-shadow: var(--shadow-md);
+    }
+    .header {
+      text-align: center;
+      margin-bottom: 22px;
+    }
+    .header-icon {
+      width: 52px;
+      height: 52px;
+      background: var(--primary-light);
+      border-radius: 16px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 26px;
+      margin-bottom: 10px;
+      border: 1px solid #bae6fd;
+    }
+    .header h1 {
+      font-size: 1.5rem;
+      font-weight: 700;
+      color: #0f172a;
+      letter-spacing: -0.5px;
+    }
+    .header p {
+      color: var(--text-muted);
+      font-size: 0.85rem;
+      margin-top: 4px;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 12px;
+      border-radius: 9999px;
+      background: var(--accent-light);
+      color: #059669;
+      font-size: 0.75rem;
+      font-weight: 600;
+      margin-top: 10px;
+      border: 1px solid #a7f3d0;
+    }
+    .badge-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: #10b981;
+      display: inline-block;
+    }
+    .dose-grid {
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      margin-bottom: 22px;
+    }
+    .dose-card {
+      background: #f8fafc;
+      border: 1.5px solid var(--border);
+      border-radius: 18px;
+      padding: 14px;
+      transition: all 0.2s ease;
+    }
+    .dose-card:focus-within {
+      border-color: var(--border-focus);
+      background: #ffffff;
+      box-shadow: 0 4px 12px rgba(2, 132, 199, 0.08);
+    }
+    .dose-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 10px;
+    }
+    .dose-tag {
+      font-size: 0.78rem;
+      font-weight: 700;
+      color: var(--primary);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .compartment-pill {
+      background: #e2e8f0;
+      color: #475569;
+      padding: 2px 8px;
+      border-radius: 6px;
+      font-size: 0.7rem;
+      font-weight: 600;
+    }
+    .dose-inputs {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+    }
+    .input-wrapper {
+      flex: 1;
+      position: relative;
+    }
+    .input-name {
+      width: 100%;
+      background: #ffffff;
+      border: 1px solid var(--border);
+      color: #1e293b;
+      padding: 8px 12px;
+      border-radius: 10px;
+      font-size: 0.9rem;
+      font-weight: 500;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    .input-name:focus {
+      border-color: var(--primary);
+    }
+    .input-name::placeholder {
+      color: #94a3b8;
+      font-size: 0.85rem;
+    }
+    .input-time {
+      width: 108px;
+      background: #ffffff;
+      border: 1px solid var(--border);
+      color: #0f172a;
+      padding: 8px 8px;
+      border-radius: 10px;
+      font-size: 0.95rem;
+      font-weight: 600;
+      outline: none;
+      text-align: center;
+      transition: border-color 0.2s;
+    }
+    .input-time:focus {
+      border-color: var(--primary);
+    }
+    /* iOS Style Toggle Switch */
+    .toggle {
+      position: relative;
+      width: 42px;
+      height: 24px;
+      display: inline-block;
+      flex-shrink: 0;
+    }
+    .toggle input { opacity: 0; width: 0; height: 0; }
+    .slider {
+      position: absolute;
+      cursor: pointer;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background-color: #cbd5e1;
+      transition: .25s ease;
+      border-radius: 24px;
+    }
+    .slider:before {
+      position: absolute;
+      content: "";
+      height: 18px;
+      width: 18px;
+      left: 3px;
+      bottom: 3px;
+      background-color: #ffffff;
+      transition: .25s ease;
+      border-radius: 50%;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+    }
+    input:checked + .slider { background-color: var(--accent); }
+    input:checked + .slider:before { transform: translateX(18px); }
+
+    .btn-group {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    button {
+      width: 100%;
+      padding: 12px;
+      border-radius: 12px;
+      font-size: 0.92rem;
+      font-weight: 600;
+      cursor: pointer;
+      border: none;
+      transition: all 0.2s ease;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      gap: 8px;
+    }
+    .btn-save {
+      background: linear-gradient(135deg, #0284c7 0%, #0369a1 100%);
+      color: #ffffff;
+      box-shadow: 0 4px 12px rgba(2, 132, 199, 0.25);
+    }
+    .btn-save:hover {
+      box-shadow: 0 6px 16px rgba(2, 132, 199, 0.35);
+      transform: translateY(-1px);
+    }
+    .btn-sync {
+      background: var(--accent-light);
+      border: 1.5px solid #a7f3d0;
+      color: #059669;
+    }
+    .btn-sync:hover {
+      background: #d1fae5;
+    }
+    .btn-dispense {
+      background: var(--danger-light);
+      border: 1.5px solid #fecdd3;
+      color: #be123c;
+    }
+    .btn-dispense:hover {
+      background: #ffe4e6;
+    }
+    .toast {
+      margin-top: 14px;
+      text-align: center;
+      font-size: 0.85rem;
+      font-weight: 600;
+      padding: 10px;
+      border-radius: 10px;
+      display: none;
+      animation: fadeIn 0.3s;
+    }
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(-4px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .toast.success { display: block; background: #ecfdf5; color: #065f46; border: 1px solid #a7f3d0; }
+    .toast.info { display: block; background: #e0f2fe; color: #075985; border: 1px solid #bae6fd; }
+    .toast.danger { display: block; background: #fef2f2; color: #991b1b; border: 1px solid #fecaca; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <div class="header-icon">💊</div>
+      <h1>MediDispense</h1>
+      <p>Intelligent Pill Reminder & Dispenser</p>
+      <div class="badge">
+        <span class="badge-dot"></span>
+        <span id="status-badge">System Active</span>
+      </div>
+    </div>
+
+    <form id="schedule-form">
+      <div class="dose-grid">
+        <!-- Dose 1 -->
+        <div class="dose-card">
+          <div class="dose-header">
+            <span class="dose-tag">
+              ☀️ Dose 1 (Morning)
+              <span class="compartment-pill">Comp 1</span>
+            </span>
+            <label class="toggle"><input type="checkbox" id="e1" checked><span class="slider"></span></label>
+          </div>
+          <div class="dose-inputs">
+            <div class="input-wrapper">
+              <input type="text" class="input-name" id="n1" placeholder="Medicine Name (e.g. Paracetamol)" maxlength="15">
+            </div>
+            <input type="time" class="input-time" id="t1" value="08:00">
+          </div>
+        </div>
+
+        <!-- Dose 2 -->
+        <div class="dose-card">
+          <div class="dose-header">
+            <span class="dose-tag">
+              🌤️ Dose 2 (Noon)
+              <span class="compartment-pill">Comp 2</span>
+            </span>
+            <label class="toggle"><input type="checkbox" id="e2" checked><span class="slider"></span></label>
+          </div>
+          <div class="dose-inputs">
+            <div class="input-wrapper">
+              <input type="text" class="input-name" id="n2" placeholder="Medicine Name (e.g. Amoxicillin)" maxlength="15">
+            </div>
+            <input type="time" class="input-time" id="t2" value="13:00">
+          </div>
+        </div>
+
+        <!-- Dose 3 -->
+        <div class="dose-card">
+          <div class="dose-header">
+            <span class="dose-tag">
+              ☕ Dose 3 (Evening)
+              <span class="compartment-pill">Comp 3</span>
+            </span>
+            <label class="toggle"><input type="checkbox" id="e3" checked><span class="slider"></span></label>
+          </div>
+          <div class="dose-inputs">
+            <div class="input-wrapper">
+              <input type="text" class="input-name" id="n3" placeholder="Medicine Name (e.g. Vitamin C)" maxlength="15">
+            </div>
+            <input type="time" class="input-time" id="t3" value="18:00">
+          </div>
+        </div>
+
+        <!-- Dose 4 -->
+        <div class="dose-card">
+          <div class="dose-header">
+            <span class="dose-tag">
+              🌙 Dose 4 (Night)
+              <span class="compartment-pill">Comp 4</span>
+            </span>
+            <label class="toggle"><input type="checkbox" id="e4" checked><span class="slider"></span></label>
+          </div>
+          <div class="dose-inputs">
+            <div class="input-wrapper">
+              <input type="text" class="input-name" id="n4" placeholder="Medicine Name (e.g. Melatonin)" maxlength="15">
+            </div>
+            <input type="time" class="input-time" id="t4" value="21:00">
+          </div>
+        </div>
+      </div>
+
+      <div class="btn-group">
+        <button type="button" class="btn-save" onclick="saveSchedule()">💾 Save & Sync Schedule</button>
+        <button type="button" class="btn-sync" onclick="syncPhoneTime()">🕒 Sync Phone Time to RTC</button>
+        <button type="button" class="btn-dispense" onclick="triggerDispense()">⚙️ Test Dispense (Rotate 1 Step)</button>
+      </div>
+    </form>
+
+    <div class="toast" id="toast"></div>
+  </div>
+
+  <script>
+    function showToast(msg, type = 'success') {
+      const t = document.getElementById('toast');
+      t.className = 'toast ' + type;
+      t.innerText = msg;
+      setTimeout(() => { t.style.display = 'none'; }, 3500);
+    }
+
+    // Fetch existing schedule and medicine names on load
+    window.onload = function() {
+      fetch('/api/get')
+        .then(res => res.json())
+        .then(data => {
+          document.getElementById('t1').value = data.d1 || '08:00';
+          document.getElementById('t2').value = data.d2 || '13:00';
+          document.getElementById('t3').value = data.d3 || '18:00';
+          document.getElementById('t4').value = data.d4 || '21:00';
+
+          document.getElementById('n1').value = data.n1 || 'Medicine 1';
+          document.getElementById('n2').value = data.n2 || 'Medicine 2';
+          document.getElementById('n3').value = data.n3 || 'Medicine 3';
+          document.getElementById('n4').value = data.n4 || 'Medicine 4';
+
+          document.getElementById('e1').checked = data.e1 !== false;
+          document.getElementById('e2').checked = data.e2 !== false;
+          document.getElementById('e3').checked = data.e3 !== false;
+          document.getElementById('e4').checked = data.e4 !== false;
+        })
+        .catch(() => console.log('Loaded defaults'));
+    };
+
+    function saveSchedule() {
+      const payload = {
+        d1: document.getElementById('t1').value,
+        d2: document.getElementById('t2').value,
+        d3: document.getElementById('t3').value,
+        d4: document.getElementById('t4').value,
+        n1: document.getElementById('n1').value.trim() || 'Medicine 1',
+        n2: document.getElementById('n2').value.trim() || 'Medicine 2',
+        n3: document.getElementById('n3').value.trim() || 'Medicine 3',
+        n4: document.getElementById('n4').value.trim() || 'Medicine 4',
+        e1: document.getElementById('e1').checked ? 1 : 0,
+        e2: document.getElementById('e2').checked ? 1 : 0,
+        e3: document.getElementById('e3').checked ? 1 : 0,
+        e4: document.getElementById('e4').checked ? 1 : 0
+      };
+
+      fetch('/api/save', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams(payload)
+      })
+      .then(res => res.text())
+      .then(res => showToast('Schedule & Medicines Saved! ✅', 'success'))
+      .catch(err => showToast('Failed to save schedule ❌', 'danger'));
+    }
+
+    function syncPhoneTime() {
+      const now = new Date();
+      const Y = now.getFullYear();
+      const M = now.getMonth() + 1;
+      const D = now.getDate();
+      const h = now.getHours();
+      const m = now.getMinutes();
+      const s = now.getSeconds();
+
+      const timeStr = `${Y}-${M}-${D} ${h}:${m}:${s}`;
+      fetch('/api/synctime?time=' + encodeURIComponent(timeStr))
+        .then(res => res.text())
+        .then(() => showToast(`RTC Synced: ${h}:${m.toString().padStart(2, '0')} ✅`, 'info'))
+        .catch(() => showToast('RTC Sync failed ❌', 'danger'));
+    }
+
+    function triggerDispense() {
+      if (!confirm('Rotate servo to the next compartment now?')) return;
+      fetch('/api/dispense')
+        .then(res => res.text())
+        .then(() => showToast('Dispense command sent to STM32! ⚙️', 'info'))
+        .catch(() => showToast('Dispense command failed ❌', 'danger'));
+    }
+  </script>
+</body>
+</html>
+)rawliteral";
+
+// --- Send Full Schedule & Medicine Names to STM32 over UART ---
+void sendScheduleToSTM32() {
+  // Protocol: "SCHED:HH:MM,E,HH:MM,E,HH:MM,E,HH:MM,E\n"
+  Serial.print("SCHED:");
+  Serial.print(schedule.dose1); Serial.print(","); Serial.print(schedule.en1 ? "1" : "0"); Serial.print(",");
+  Serial.print(schedule.dose2); Serial.print(","); Serial.print(schedule.en2 ? "1" : "0"); Serial.print(",");
+  Serial.print(schedule.dose3); Serial.print(","); Serial.print(schedule.en3 ? "1" : "0"); Serial.print(",");
+  Serial.print(schedule.dose4); Serial.print(","); Serial.println(schedule.en4 ? "1" : "0");
+
+  delay(50);
+  // Transmit Medicine Names
+  Serial.print("NAME1:"); Serial.println(schedule.name1);
+  delay(30);
+  Serial.print("NAME2:"); Serial.println(schedule.name2);
+  delay(30);
+  Serial.print("NAME3:"); Serial.println(schedule.name3);
+  delay(30);
+  Serial.print("NAME4:"); Serial.println(schedule.name4);
+}
+
+void setupEEPROM() {
+  EEPROM.begin(sizeof(Schedule) + 16);
+  EEPROM.get(EEPROM_ADDR, schedule);
+
+  // Validate or set defaults
+  if (schedule.dose1[0] < '0' || schedule.dose1[0] > '2') {
+    strcpy(schedule.dose1, "08:00");
+    strcpy(schedule.dose2, "13:00");
+    strcpy(schedule.dose3, "18:00");
+    strcpy(schedule.dose4, "21:00");
+    schedule.en1 = true;
+    schedule.en2 = true;
+    schedule.en3 = true;
+    schedule.en4 = true;
+    strcpy(schedule.name1, "Paracetamol");
+    strcpy(schedule.name2, "Amoxicillin");
+    strcpy(schedule.name3, "Vitamin C");
+    strcpy(schedule.name4, "Melatonin");
+    EEPROM.put(EEPROM_ADDR, schedule);
+    EEPROM.commit();
+  }
+}
+
+void setup() {
+  // Serial baud rate for STM32 communication
+  Serial.begin(115200);
+  delay(500);
+
+  setupEEPROM();
+
+  // Configure Soft Access Point
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(apSSID, apPASS);
+
+  // Server Routes
+  server.on("/", HTTP_GET, []() {
+    server.send_P(200, "text/html", INDEX_HTML);
+  });
+
+  server.on("/api/get", HTTP_GET, []() {
+    String json = "{";
+    json += "\"d1\":\"" + String(schedule.dose1) + "\",";
+    json += "\"d2\":\"" + String(schedule.dose2) + "\",";
+    json += "\"d3\":\"" + String(schedule.dose3) + "\",";
+    json += "\"d4\":\"" + String(schedule.dose4) + "\",";
+    json += "\"n1\":\"" + String(schedule.name1) + "\",";
+    json += "\"n2\":\"" + String(schedule.name2) + "\",";
+    json += "\"n3\":\"" + String(schedule.name3) + "\",";
+    json += "\"n4\":\"" + String(schedule.name4) + "\",";
+    json += "\"e1\":" + String(schedule.en1 ? "true" : "false") + ",";
+    json += "\"e2\":" + String(schedule.en2 ? "true" : "false") + ",";
+    json += "\"e3\":" + String(schedule.en3 ? "true" : "false") + ",";
+    json += "\"e4\":" + String(schedule.en4 ? "true" : "false");
+    json += "}";
+    server.send(200, "application/json", json);
+  });
+
+  server.on("/api/save", HTTP_POST, []() {
+    if (server.hasArg("d1")) strncpy(schedule.dose1, server.arg("d1").c_str(), 5);
+    if (server.hasArg("d2")) strncpy(schedule.dose2, server.arg("d2").c_str(), 5);
+    if (server.hasArg("d3")) strncpy(schedule.dose3, server.arg("d3").c_str(), 5);
+    if (server.hasArg("d4")) strncpy(schedule.dose4, server.arg("d4").c_str(), 5);
+    schedule.dose1[5] = '\0';
+    schedule.dose2[5] = '\0';
+    schedule.dose3[5] = '\0';
+    schedule.dose4[5] = '\0';
+
+    if (server.hasArg("n1")) strncpy(schedule.name1, server.arg("n1").c_str(), 15);
+    if (server.hasArg("n2")) strncpy(schedule.name2, server.arg("n2").c_str(), 15);
+    if (server.hasArg("n3")) strncpy(schedule.name3, server.arg("n3").c_str(), 15);
+    if (server.hasArg("n4")) strncpy(schedule.name4, server.arg("n4").c_str(), 15);
+    schedule.name1[15] = '\0';
+    schedule.name2[15] = '\0';
+    schedule.name3[15] = '\0';
+    schedule.name4[15] = '\0';
+
+    schedule.en1 = (server.arg("e1") == "1");
+    schedule.en2 = (server.arg("e2") == "1");
+    schedule.en3 = (server.arg("e3") == "1");
+    schedule.en4 = (server.arg("e4") == "1");
+
+    EEPROM.put(EEPROM_ADDR, schedule);
+    EEPROM.commit();
+
+    sendScheduleToSTM32();
+    server.send(200, "text/plain", "OK");
+  });
+
+  server.on("/api/synctime", HTTP_GET, []() {
+    if (server.hasArg("time")) {
+      String t = server.arg("time"); // e.g. "2026-10-14 08:30:00"
+      Serial.print("TIME:");
+      Serial.println(t);
+      server.send(200, "text/plain", "OK");
+    } else {
+      server.send(400, "text/plain", "Missing time");
+    }
+  });
+
+  server.on("/api/dispense", HTTP_GET, []() {
+    Serial.println("CMD:DISPENSE");
+    server.send(200, "text/plain", "OK");
+  });
+
+  server.begin();
+
+  // Send initial schedule to STM32 upon power up
+  delay(1000);
+  sendScheduleToSTM32();
+}
+
+void loop() {
+  server.handleClient();
+
+  // Optional: Read any status reports sent back from STM32
+  if (Serial.available()) {
+    String msg = Serial.readStringUntil('\n');
+    msg.trim();
+  }
+}

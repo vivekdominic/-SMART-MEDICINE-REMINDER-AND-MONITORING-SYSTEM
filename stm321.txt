@@ -1,0 +1,412 @@
+/*
+  =============================================================================
+  Project: Smart Medicine Dispenser - STM32 Blue Pill Controller
+  Microcontroller: STM32F103C8T6 ("Blue Pill")
+  Peripherals:
+    - DS3231 RTC Module (I2C1: SCL=PB6, SDA=PB7)
+    - 1.3" OLED Display (I2C1: SCL=PB6, SDA=PB7, Driver SH1106 / SSD1306)
+    - ESP-01 WiFi Module (USART2: TX=PA2, RX=PA3)
+    - Servo Motor (PWM Pin: PA0) -> 4-Step Compartment indexing
+    - Active Buzzer (Pin: PB0)
+    - Alert LED (Pin: PB1) + Onboard LED (PC13)
+    - Acknowledge Push Button (Pin: PB12, INPUT_PULLUP)
+  =============================================================================
+*/
+
+#include <Wire.h>
+#include <RTClib.h>
+#include <U8g2lib.h>
+#include <Servo.h>
+
+// --- Pin Definitions ---
+#define PIN_SERVO       PA0
+#define PIN_BUZZER      PB0
+#define PIN_ALERT_LED   PB1
+#define PIN_ONBOARD_LED PC13
+#define PIN_BUTTON      PB12 // Active LOW (connect to GND when pressed)
+
+// --- OLED Display Setup ---
+// Most 1.3" I2C OLED displays use the SH1106 driver.
+// If your display uses SSD1306, uncomment the SSD1306 constructor below.
+U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
+// U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
+
+// --- RTC Setup ---
+RTC_DS3231 rtc;
+
+// --- Servo Setup ---
+Servo dispenserServo;
+
+// 4 distinct angles for the 4 compartments
+// Compartment 1: 0°, Compartment 2: 60°, Compartment 3: 120°, Compartment 4: 180°
+const int STEP_ANGLES[4] = { 0, 60, 120, 180 };
+int currentCompartment = 0; // 0 to 3
+
+// --- Serial Ports on STM32 ---
+// Serial: PA9 (TX), PA10 (RX) -> PC Serial Monitor (Debugging)
+// EspSerial: Explicitly instantiate USART2 with RX on PA3 and TX on PA2.
+// This resolves the "undefined reference to Serial2" linker error on STM32 core.
+Uart EspSerial(PA3, PA2);
+
+// --- Medicine Schedule Storage ---
+struct DoseTime {
+  int hour;
+  int minute;
+  bool enabled;
+  bool triggeredToday;
+  char name[16];
+};
+
+DoseTime doses[4] = {
+  { 8,  0, true, false, "Paracetamol" }, // Dose 1
+  { 13, 0, true, false, "Amoxicillin" }, // Dose 2
+  { 18, 0, true, false, "Vitamin C"   }, // Dose 3
+  { 21, 0, true, false, "Melatonin"   }  // Dose 4
+};
+
+// --- Alarm State Variables ---
+bool isAlarmActive = false;
+int activeDoseIndex = -1;
+unsigned long alarmStartTime = 0;
+const unsigned long ALARM_TIMEOUT_MS = 60000; // Auto-silence after 60 seconds
+unsigned long lastBlinkTime = 0;
+bool blinkState = false;
+int lastDayChecked = -1;
+
+// --- Function Prototypes ---
+void processEspCommands();
+void parseSchedule(String payload);
+void parseRtcSync(String payload);
+void advanceServoStep();
+void triggerAlarm(int doseIdx);
+void stopAlarm();
+void updateOledDisplay(const DateTime &now);
+
+void setup() {
+  // Start Debug Serial (to PC)
+  Serial.begin(115200);
+  delay(200);
+  Serial.println("\n[SYSTEM] Booting STM32 Smart Medicine Dispenser...");
+
+  // Start UART to ESP-01
+  EspSerial.begin(115200);
+
+  // Initialize GPIOs
+  pinMode(PIN_BUZZER, OUTPUT);
+  pinMode(PIN_ALERT_LED, OUTPUT);
+  pinMode(PIN_ONBOARD_LED, OUTPUT);
+  pinMode(PIN_BUTTON, INPUT_PULLUP);
+
+  digitalWrite(PIN_BUZZER, LOW);
+  digitalWrite(PIN_ALERT_LED, LOW);
+  digitalWrite(PIN_ONBOARD_LED, HIGH); // PC13 is active LOW
+
+  // Initialize I2C Bus (PB6=SCL, PB7=SDA)
+  Wire.begin();
+
+  // Initialize OLED
+  u8g2.begin();
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_helvB08_tr);
+  u8g2.drawStr(12, 28, "MediDispense v1.1");
+  u8g2.drawStr(16, 44, "Initializing...");
+  u8g2.sendBuffer();
+
+  // Initialize RTC
+  if (!rtc.begin()) {
+    Serial.println("[ERROR] DS3231 RTC not found!");
+    u8g2.clearBuffer();
+    u8g2.drawStr(10, 32, "RTC NOT FOUND!");
+    u8g2.sendBuffer();
+    delay(2000);
+  } else {
+    Serial.println("[OK] DS3231 RTC Connected.");
+  }
+
+  // Initialize Servo
+  dispenserServo.attach(PIN_SERVO);
+  dispenserServo.write(STEP_ANGLES[currentCompartment]);
+  delay(600);
+  dispenserServo.detach(); // Detach to prevent jitter & save power
+
+  // Startup beep
+  digitalWrite(PIN_BUZZER, HIGH);
+  digitalWrite(PIN_ALERT_LED, HIGH);
+  delay(150);
+  digitalWrite(PIN_BUZZER, LOW);
+  digitalWrite(PIN_ALERT_LED, LOW);
+
+  Serial.println("[OK] Initialization Complete.");
+}
+
+void loop() {
+  DateTime now = rtc.now();
+
+  // Reset daily triggered flags at midnight
+  if (now.day() != lastDayChecked) {
+    for (int i = 0; i < 4; i++) {
+      doses[i].triggeredToday = false;
+    }
+    lastDayChecked = now.day();
+  }
+
+  // 1. Check for incoming UART commands from ESP-01
+  processEspCommands();
+
+  // 2. Check if button is pressed to acknowledge alarm
+  if (digitalRead(PIN_BUTTON) == LOW) {
+    if (isAlarmActive) {
+      stopAlarm();
+    }
+    delay(200); // Debounce
+  }
+
+  // 3. Handle Active Alarm Beeping & Blinking
+  if (isAlarmActive) {
+    unsigned long currentMillis = millis();
+
+    // Blink and beep every 250ms
+    if (currentMillis - lastBlinkTime >= 250) {
+      lastBlinkTime = currentMillis;
+      blinkState = !blinkState;
+      digitalWrite(PIN_ALERT_LED, blinkState ? HIGH : LOW);
+      digitalWrite(PIN_ONBOARD_LED, blinkState ? LOW : HIGH);
+      digitalWrite(PIN_BUZZER, blinkState ? HIGH : LOW);
+    }
+
+    // Auto timeout after 60s
+    if (currentMillis - alarmStartTime >= ALARM_TIMEOUT_MS) {
+      stopAlarm();
+    }
+  } else {
+    // 4. Compare current time with reminder schedule
+    for (int i = 0; i < 4; i++) {
+      if (doses[i].enabled && !doses[i].triggeredToday) {
+        if (now.hour() == doses[i].hour && now.minute() == doses[i].minute) {
+          doses[i].triggeredToday = true;
+          triggerAlarm(i);
+          break;
+        }
+      }
+    }
+  }
+
+  // 5. Refresh OLED Display every 500ms
+  static unsigned long lastDisplayUpdate = 0;
+  if (millis() - lastDisplayUpdate >= 500) {
+    lastDisplayUpdate = millis();
+    updateOledDisplay(now);
+  }
+}
+
+// --- Process UART from ESP-01 ---
+void processEspCommands() {
+  while (EspSerial.available()) {
+    String line = EspSerial.readStringUntil('\n');
+    line.trim();
+
+    if (line.startsWith("SCHED:")) {
+      Serial.print("[ESP->STM32] Schedule received: ");
+      Serial.println(line);
+      parseSchedule(line.substring(6));
+    }
+    else if (line.startsWith("NAME1:")) {
+      strncpy(doses[0].name, line.substring(6).c_str(), 15);
+      doses[0].name[15] = '\0';
+      Serial.printf("[ESP->STM32] Med 1 Name: %s\n", doses[0].name);
+    }
+    else if (line.startsWith("NAME2:")) {
+      strncpy(doses[1].name, line.substring(6).c_str(), 15);
+      doses[1].name[15] = '\0';
+      Serial.printf("[ESP->STM32] Med 2 Name: %s\n", doses[1].name);
+    }
+    else if (line.startsWith("NAME3:")) {
+      strncpy(doses[2].name, line.substring(6).c_str(), 15);
+      doses[2].name[15] = '\0';
+      Serial.printf("[ESP->STM32] Med 3 Name: %s\n", doses[2].name);
+    }
+    else if (line.startsWith("NAME4:")) {
+      strncpy(doses[3].name, line.substring(6).c_str(), 15);
+      doses[3].name[15] = '\0';
+      Serial.printf("[ESP->STM32] Med 4 Name: %s\n", doses[3].name);
+    }
+    else if (line.startsWith("TIME:")) {
+      Serial.print("[ESP->STM32] RTC Sync received: ");
+      Serial.println(line);
+      parseRtcSync(line.substring(5));
+    }
+    else if (line.equals("CMD:DISPENSE")) {
+      Serial.println("[ESP->STM32] Manual Dispense requested.");
+      advanceServoStep();
+      // Single confirmation beep
+      digitalWrite(PIN_BUZZER, HIGH);
+      delay(100);
+      digitalWrite(PIN_BUZZER, LOW);
+    }
+  }
+}
+
+// --- Parse Schedule String: "08:00,1,13:00,1,18:00,1,21:00,1" ---
+void parseSchedule(String payload) {
+  int cur = 0;
+  for (int i = 0; i < 4; i++) {
+    int comma1 = payload.indexOf(',', cur);
+    if (comma1 == -1) break;
+    String timeStr = payload.substring(cur, comma1);
+    
+    int comma2 = payload.indexOf(',', comma1 + 1);
+    String enStr;
+    if (comma2 != -1) {
+      enStr = payload.substring(comma1 + 1, comma2);
+      cur = comma2 + 1;
+    } else {
+      enStr = payload.substring(comma1 + 1);
+    }
+
+    int colon = timeStr.indexOf(':');
+    if (colon != -1) {
+      doses[i].hour = timeStr.substring(0, colon).toInt();
+      doses[i].minute = timeStr.substring(colon + 1).toInt();
+      doses[i].enabled = (enStr == "1");
+      doses[i].triggeredToday = false;
+    }
+  }
+
+  // Feedback to PC
+  for (int i = 0; i < 4; i++) {
+    Serial.printf("  Dose %d: %s at %02d:%02d [En: %s]\n", i + 1, doses[i].name, doses[i].hour, doses[i].minute, doses[i].enabled ? "YES" : "NO");
+  }
+}
+
+// --- Parse RTC Sync String: "2026-10-14 08:30:00" ---
+void parseRtcSync(String payload) {
+  int year = payload.substring(0, 4).toInt();
+  int month = payload.substring(5, 7).toInt();
+  int day = payload.substring(8, 10).toInt();
+  int hour = payload.substring(11, 13).toInt();
+  int minute = payload.substring(14, 16).toInt();
+  int second = payload.substring(17, 19).toInt();
+
+  if (year >= 2024 && month >= 1 && month <= 12 && day >= 1 && day <= 31) {
+    rtc.adjust(DateTime(year, month, day, hour, minute, second));
+    Serial.println("[OK] DS3231 RTC adjusted successfully!");
+  }
+}
+
+// --- Rotate Servo to the Next Compartment (4 Steps) ---
+void advanceServoStep() {
+  currentCompartment = (currentCompartment + 1) % 4;
+  int targetAngle = STEP_ANGLES[currentCompartment];
+
+  Serial.printf("[SERVO] Moving to Step %d (Angle: %d deg)\n", currentCompartment + 1, targetAngle);
+
+  dispenserServo.attach(PIN_SERVO);
+  dispenserServo.write(targetAngle);
+  delay(700); // Give servo time to complete physical motion
+  dispenserServo.detach(); // Detach to eliminate buzzing/jitter
+}
+
+// --- Trigger Alarm Sequence ---
+void triggerAlarm(int doseIdx) {
+  isAlarmActive = true;
+  activeDoseIndex = doseIdx;
+  alarmStartTime = millis();
+  lastBlinkTime = millis();
+  blinkState = true;
+
+  Serial.printf("[ALARM] Triggered Dose %d (%s)! Dispensing compartment...\n", doseIdx + 1, doses[doseIdx].name);
+
+  // Automatically advance servo to present the scheduled compartment
+  advanceServoStep();
+}
+
+// --- Silence Alarm ---
+void stopAlarm() {
+  isAlarmActive = false;
+  activeDoseIndex = -1;
+  digitalWrite(PIN_BUZZER, LOW);
+  digitalWrite(PIN_ALERT_LED, LOW);
+  digitalWrite(PIN_ONBOARD_LED, HIGH);
+  Serial.println("[ALARM] Silenced.");
+}
+
+// --- OLED UI Rendering ---
+void updateOledDisplay(const DateTime &now) {
+  u8g2.clearBuffer();
+
+  if (isAlarmActive) {
+    // --- Alarm Screen ---
+    u8g2.setFont(u8g2_font_helvB10_tr);
+    u8g2.drawStr(10, 16, "! MEDICINE TIME !");
+
+    // Display the specific medicine name!
+    u8g2.setFont(u8g2_font_helvB08_tr);
+    char takeMsg[32];
+    sprintf(takeMsg, "Take: %s", doses[activeDoseIndex].name);
+    u8g2.drawStr(6, 34, takeMsg);
+
+    u8g2.setFont(u8g2_font_6x10_tr);
+    char compMsg[32];
+    sprintf(compMsg, "Comp %d (Dose %d)", activeDoseIndex + 1, activeDoseIndex + 1);
+    u8g2.drawStr(6, 48, compMsg);
+    u8g2.drawStr(6, 60, "Press Button to Mute");
+  } else {
+    // --- Normal Standby Dashboard ---
+    // 1. Header: Current Time
+    u8g2.setFont(u8g2_font_helvB10_tr);
+    char timeStr[12];
+    sprintf(timeStr, "%02d:%02d:%02d", now.hour(), now.minute(), now.second());
+    u8g2.drawStr(34, 14, timeStr);
+
+    // 2. Date line
+    u8g2.setFont(u8g2_font_6x10_tr);
+    char dateStr[20];
+    sprintf(dateStr, "%02d/%02d/%04d", now.day(), now.month(), now.year());
+    u8g2.drawStr(32, 26, dateStr);
+
+    // Divider line
+    u8g2.drawHLine(0, 30, 128);
+
+    // 3. Find Next Upcoming Dose
+    int nextIdx = -1;
+    int currentMinutes = now.hour() * 60 + now.minute();
+    int minDiff = 9999;
+
+    for (int i = 0; i < 4; i++) {
+      if (doses[i].enabled) {
+        int doseMinutes = doses[i].hour * 60 + doses[i].minute;
+        int diff = doseMinutes - currentMinutes;
+        if (diff > 0 && diff < minDiff) {
+          minDiff = diff;
+          nextIdx = i;
+        }
+      }
+    }
+    // If none remaining today, first enabled dose tomorrow
+    if (nextIdx == -1) {
+      for (int i = 0; i < 4; i++) {
+        if (doses[i].enabled) {
+          nextIdx = i;
+          break;
+        }
+      }
+    }
+
+    u8g2.setFont(u8g2_font_6x10_tr);
+    if (nextIdx != -1) {
+      char nextStr[32];
+      sprintf(nextStr, "Next: %s", doses[nextIdx].name);
+      u8g2.drawStr(2, 44, nextStr);
+      char timeSlotStr[32];
+      sprintf(timeSlotStr, "@ %02d:%02d (Comp %d)", doses[nextIdx].hour, doses[nextIdx].minute, nextIdx + 1);
+      u8g2.drawStr(2, 54, timeSlotStr);
+    } else {
+      u8g2.drawStr(2, 46, "Next: None set");
+    }
+
+    // 4. Compartment & WiFi Status
+    u8g2.drawStr(2, 64, "WiFi: MediDispense");
+  }
+
+  u8g2.sendBuffer();
+}
